@@ -224,7 +224,12 @@ main.o: /project/source/main.cpp /opt/devkitpro/libnx/include/switch.h \
  /opt/devkitpro/portlibs/switch/include/SDL2/SDL_image.h \
  /opt/devkitpro/portlibs/switch/include/SDL2/SDL.h \
  /opt/devkitpro/portlibs/switch/include/SDL2/SDL_ttf.h \
- /project/include/apk.h
+ /project/include/apk.h /project/include/compat/loader.h \
+ /project/include/compat/android.h \
+ /opt/devkitpro/portlibs/switch/include/EGL/egl.h \
+ /opt/devkitpro/portlibs/switch/include/EGL/eglplatform.h \
+ /opt/devkitpro/portlibs/switch/include/KHR/khrplatform.h \
+ /project/include/compat/jni.h
 /opt/devkitpro/libnx/include/switch.h:
 /opt/devkitpro/libnx/include/switch/types.h:
 /opt/devkitpro/libnx/include/switch/result.h:
@@ -452,3 +457,9 @@ main.o: /project/source/main.cpp /opt/devkitpro/libnx/include/switch.h \
 /opt/devkitpro/portlibs/switch/include/SDL2/SDL.h:
 /opt/devkitpro/portlibs/switch/include/SDL2/SDL_ttf.h:
 /project/include/apk.h:
+/project/include/compat/loader.h:
+/project/include/compat/android.h:
+/opt/devkitpro/portlibs/switch/include/EGL/egl.h:
+/opt/devkitpro/portlibs/switch/include/EGL/eglplatform.h:
+/opt/devkitpro/portlibs/switch/include/KHR/khrplatform.h:
+/project/include/compat/jni.h:
