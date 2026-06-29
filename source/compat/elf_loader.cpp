@@ -13,6 +13,10 @@ extern void compatLogFmt(const char* fmt, ...);
 // External shim table from shim_table.cpp
 void* shimResolve(const char* name);
 
+// Count of unresolved symbols from the most recent elfLoad call
+static int g_unresolved_count = 0;
+int elfGetUnresolvedCount() { return g_unresolved_count; }
+
 // All successfully loaded .so files (for cross-library symbol resolution)
 static std::vector<LoadedSo*> g_loaded_sos;
 
@@ -78,7 +82,7 @@ static void applyRela(LoadedSo* so, const Elf64_Rela* relas, size_t count) {
             sym_addr = (uint64_t)resolveSymbol(sym_name);
             if (!sym_addr) {
                 compatLogFmt("ELF: unresolved: %s", sym_name);
-                // Leave as 0; will crash if called, but many symbols are optional
+                g_unresolved_count++;
             }
         }
 
@@ -102,6 +106,7 @@ static void applyRela(LoadedSo* so, const Elf64_Rela* relas, size_t count) {
 
 // ─── elfLoad ──────────────────────────────────────────────────────────────────
 LoadedSo* elfLoad(const char* path) {
+    g_unresolved_count = 0;
     compatLogFmt("ELF: loading %s", path);
 
     // Read the entire file

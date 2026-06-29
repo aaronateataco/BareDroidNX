@@ -117,17 +117,35 @@ struct CompatLayer {
     void*  env_outer;  // passed to ANativeActivity.env (JNIEnv*)
 };
 
+// ─── Launch result ────────────────────────────────────────────────────────────
+struct LaunchResult {
+    bool        ok          = false;
+    std::string errorStage;   // which step failed (e.g. "Extracting APK")
+    std::string errorDetail;  // human-readable reason
+    int         unresolved  = 0;  // number of unresolved ELF symbols
+    uint32_t    svcPermCode = 0;  // result of svcSetMemoryPermission (0 = OK)
+};
+
+// Progress callback invoked at each major launch stage.
+// stage  = short label ("Extracting APK", "Loading ELF", …)
+// detail = one-liner with more info (filename, size, etc.)
+typedef void (*ProgressCb)(const char* stage, const char* detail);
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 // Returns the global compat layer (singleton)
 CompatLayer* compatGet();
 
 // Load a single .so from disk
 LoadedSo*    elfLoad(const char* path);
+// Number of unresolved symbols from the last elfLoad call
+int          elfGetUnresolvedCount();
 // Resolve a symbol across all loaded .so files, then shim table
 void*        shimResolve(const char* name);
 // Called from jni_env.cpp to install JNI/VM tables into compat layer
 void         jniSetup(CompatLayer* cl);
 
-// High-level launcher — extracts APK, loads libs, runs game
-// Returns false if extraction/loading failed (logs to SD card)
-bool         launchApk(const std::string& apk_path, const std::string& pkg_name);
+// High-level launcher — extracts APK, loads libs, runs game.
+// cb is called (if non-null) at each stage so the UI can show progress.
+LaunchResult launchApk(const std::string& apk_path,
+                       const std::string& pkg_name,
+                       ProgressCb         cb = nullptr);

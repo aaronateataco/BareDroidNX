@@ -18,7 +18,7 @@ INCLUDES	:=	include
 ROMFS		:=	romfs
 
 APP_TITLE	:= BareDroidNX
-APP_AUTHOR	:= FascinatingPistachio
+APP_AUTHOR	:= aaronworld.uk
 APP_VERSION	:= 0.1.0
 
 #---------------------------------------------------------------------------------

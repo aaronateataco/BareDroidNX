@@ -37,6 +37,9 @@ static const SDL_Color C_WHITE  = {255, 255, 255, 255};
 static const SDL_Color C_GRAY   = {160, 160, 180, 255};
 static const SDL_Color C_DIM    = {100, 100, 120, 255};
 static const SDL_Color C_ICON_PH= {50,  50,  75,  255};
+static const SDL_Color C_OK     = {80,  200, 80,  255};
+static const SDL_Color C_ERR    = {220, 80,  80,  255};
+static const SDL_Color C_WARN   = {220, 180, 60,  255};
 
 // ---------------------------------------------------------------------------
 // Log helpers — writes to SD card so we can inspect errors without a screen
@@ -79,7 +82,6 @@ struct App {
 
     // ------------------------------------------------------------------
     TTF_Font* openFont(int ptsize) {
-        // 1. Try Switch system font (BFTTF = 8-byte header + OTF data)
         plInitialize(PlServiceType_User);
         PlFontData fd = {};
         if (plGetSharedFontByType(&fd, PlSharedFontType_Standard) == 0 && fd.size > 8) {
@@ -91,7 +93,6 @@ struct App {
         } else {
             logMsg("  plGetSharedFontByType failed");
         }
-        // 2. Fallback: bundled DejaVu Sans in romfs
         romfsInit();
         TTF_Font* f = TTF_OpenFont("romfs:/fonts/DejaVuSans.ttf", ptsize);
         if (f) { logMsg("  font: romfs DejaVuSans"); return f; }
@@ -117,7 +118,6 @@ struct App {
         }
         logMsg("TTF_Init OK");
 
-        // On Switch SDL2, SDL_WINDOW_SHOWN is correct — fullscreen is implicit
         win = SDL_CreateWindow("BareDroidNX",
             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
             SW, SH, SDL_WINDOW_SHOWN);
@@ -292,49 +292,115 @@ struct App {
     }
 
     // ------------------------------------------------------------------
-    void showLaunchStub(int idx) {
+    // Show the current launch stage on-screen so the user isn't staring
+    // at a frozen display while extraction / ELF loading runs.
+    // ------------------------------------------------------------------
+    void showProgress(const char* stage, const char* detail) {
+        fill(0, 0, SW, SH, C_BG);
+        fill(0, 0, SW, HEADER_H, C_HEADER);
+        drawText(fLg, "BareDroidNX", C_WHITE, 30, (HEADER_H - 28) / 2);
+        drawText(fSm, "Launching...", C_DIM, SW - 160, (HEADER_H - 18) / 2);
+
+        int y = LIST_Y + 50;
+        drawText(fLg, stage ? stage : "Working...", C_WHITE, 40, y);
+        y += 48;
+        if (detail && detail[0])
+            drawText(fSm, detail, C_GRAY, 40, y);
+
+        fill(0, SH - FOOTER_H, SW, FOOTER_H, C_FOOTER);
+        drawText(fSm, "Please wait — check sdmc:/BareDroidNX/compat_log.txt for details",
+                 C_DIM, 30, SH - FOOTER_H + (FOOTER_H - 18) / 2);
+
+        SDL_RenderPresent(rdr);
+    }
+
+    // ------------------------------------------------------------------
+    // Show the result of a launch attempt with full diagnostic info.
+    // ------------------------------------------------------------------
+    void showLaunchResult(const LaunchResult& res, int idx) {
+        if (idx < 0 || idx >= (int)apks.size()) return;
         const ApkInfo& apk = apks[idx];
+
         bool done = false;
         while (!done) {
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {
-                if (ev.type == SDL_QUIT) done = true;
+                if (ev.type == SDL_QUIT) { done = true; }
                 if (ev.type == SDL_JOYBUTTONDOWN &&
-                    ev.jbutton.button == BTN_B)   done = true;
+                    ev.jbutton.button == BTN_B)   { done = true; }
                 if (ev.type == SDL_KEYDOWN &&
-                    ev.key.keysym.sym == SDLK_ESCAPE) done = true;
+                    ev.key.keysym.sym == SDLK_ESCAPE) { done = true; }
             }
 
             fill(0, 0, SW, SH, C_BG);
+            fill(0, 0, SW, HEADER_H, C_HEADER);
+            drawText(fLg, "BareDroidNX", C_WHITE, 30, (HEADER_H - 28) / 2);
 
+            // Game icon (small)
+            int iconSz = 96;
             if (idx < (int)icons.size() && icons[idx]) {
-                int sz = 200;
-                SDL_Rect dst = {(SW - sz) / 2, 160, sz, sz};
+                SDL_Rect dst = {(SW - iconSz) / 2, LIST_Y + 16, iconSz, iconSz};
                 SDL_RenderCopy(rdr, icons[idx], nullptr, &dst);
             }
 
+            // Game name
+            int nameY = LIST_Y + 16 + iconSz + 12;
             {
                 int w = 0, h = 0;
-                TTF_SizeUTF8(fLg, apk.appName.c_str(), &w, &h);
-                drawText(fLg, apk.appName, C_WHITE, (SW - w) / 2, 390);
+                std::string nm = clamp(fLg, apk.appName, SW - 80);
+                TTF_SizeUTF8(fLg, nm.c_str(), &w, &h);
+                drawText(fLg, nm, C_WHITE, (SW - w) / 2, nameY);
             }
+
+            // Status banner
+            std::string statusStr = res.ok ? "Launch OK" : "Launch Failed";
+            SDL_Color   statusCol = res.ok ? C_OK : C_ERR;
             {
-                std::string sub = apk.packageName;
-                if (!apk.versionName.empty()) sub += "  v" + apk.versionName;
-                if (!sub.empty()) {
-                    int w = 0, h = 0;
-                    TTF_SizeUTF8(fSm, sub.c_str(), &w, &h);
-                    drawText(fSm, sub, C_GRAY, (SW - w) / 2, 432);
+                int w = 0, h = 0;
+                TTF_SizeUTF8(fLg, statusStr.c_str(), &w, &h);
+                drawText(fLg, statusStr, statusCol, (SW - w) / 2, nameY + 44);
+            }
+
+            int y = nameY + 100;
+
+            // Failure details
+            if (!res.ok) {
+                if (!res.errorStage.empty()) {
+                    std::string s = "Failed at:  " + res.errorStage;
+                    drawText(fSm, s, C_WARN, 60, y);  y += 28;
+                }
+                if (!res.errorDetail.empty()) {
+                    drawText(fSm, res.errorDetail, C_GRAY, 60, y);  y += 28;
                 }
             }
 
-            std::string note = "(loader not yet implemented)";
-            { int w = 0, h = 0; TTF_SizeUTF8(fSm, note.c_str(), &w, &h);
-              drawText(fSm, note, C_DIM, (SW - w) / 2, 520); }
+            // Unresolved symbols — shown for both success and failure
+            if (res.unresolved > 0) {
+                char buf[128];
+                snprintf(buf, sizeof(buf),
+                         "Unresolved symbols: %d  (may crash when those code paths execute)",
+                         res.unresolved);
+                drawText(fSm, buf, C_WARN, 60, y);  y += 28;
+            }
 
-            std::string back = "B: Back";
-            { int w = 0, h = 0; TTF_SizeUTF8(fSm, back.c_str(), &w, &h);
-              drawText(fSm, back, C_DIM, (SW - w) / 2, 580); }
+            // svc memory permission failure (0xD801 = kernel won't allow Rx on heap)
+            if (res.svcPermCode != 0) {
+                char buf[128];
+                snprintf(buf, sizeof(buf),
+                         "svcSetMemPerm: 0x%08X — code pages not executable (JIT blocked)",
+                         res.svcPermCode);
+                drawText(fSm, buf, C_ERR, 60, y);  y += 28;
+                drawText(fSm,
+                         "Heap memory cannot be made Rx on Switch. JIT-capable alloc needed.",
+                         C_GRAY, 60, y);  y += 28;
+            }
+
+            y += 8;
+            drawText(fSm, "Full log: sdmc:/BareDroidNX/compat_log.txt", C_DIM, 60, y);
+
+            fill(0, SH - FOOTER_H, SW, FOOTER_H, C_FOOTER);
+            drawText(fSm, "B: Back to menu",
+                     C_DIM, 30, SH - FOOTER_H + (FOOTER_H - 18) / 2);
 
             SDL_RenderPresent(rdr);
             SDL_Delay(16);
@@ -343,8 +409,20 @@ struct App {
 };
 
 // ---------------------------------------------------------------------------
+// Global progress callback — bridges loader.cpp → App::showProgress
+// Must be defined after App so the method is in scope.
+// ---------------------------------------------------------------------------
+static App* g_app_ptr = nullptr;
+
+static void progressCallback(const char* stage, const char* detail) {
+    if (g_app_ptr) g_app_ptr->showProgress(stage, detail);
+}
+
+// ---------------------------------------------------------------------------
 int main(int, char**) {
     App app;
+    g_app_ptr = &app;
+
     if (!app.init()) return 1;
 
     mkdir(APK_DIR, 0777);
@@ -360,8 +438,8 @@ int main(int, char**) {
     app.loadIcons();
     app.render();
 
-    bool      quit        = false;
-    Uint32    lastStick   = 0;
+    bool   quit      = false;
+    Uint32 lastStick = 0;
 
     while (!quit) {
         SDL_Event ev;
@@ -375,22 +453,27 @@ int main(int, char**) {
                     case BTN_PLUS:
                         quit = true;
                         break;
+
                     case BTN_A:
                         if (!app.apks.empty()) {
                             const ApkInfo& apk = app.apks[app.selected];
-                            bool ok = launchApk(apk.path, apk.packageName.empty()
-                                                 ? apk.filename : apk.packageName);
-                            if (!ok) {
-                                // Loader returned — show stub screen with status
-                                app.showLaunchStub(app.selected);
-                            }
+                            std::string pkg = apk.packageName.empty()
+                                                ? apk.filename : apk.packageName;
+
+                            // Show a "preparing" frame before the loader starts
+                            app.showProgress("Preparing launch", apk.appName.c_str());
+
+                            LaunchResult res = launchApk(apk.path, pkg, progressCallback);
+                            app.showLaunchResult(res, app.selected);
                             redraw = true;
                         }
                         break;
+
                     case BTN_Y:
                         app.rescan();
                         redraw = true;
                         break;
+
                     case BTN_B:
                         break;
                 }

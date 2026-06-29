@@ -65,7 +65,8 @@ static bool extractEntry(unzFile zf, const std::string& dest) {
 }
 
 // ─── APK extraction ───────────────────────────────────────────────────────────
-static bool extractApk(const std::string& apk_path, const std::string& dest_dir) {
+static bool extractApk(const std::string& apk_path, const std::string& dest_dir,
+                       ProgressCb cb) {
     unzFile zf = unzOpen(apk_path.c_str());
     if (!zf) { compatLogFmt("extract: cannot open %s", apk_path.c_str()); return false; }
 
@@ -85,14 +86,15 @@ static bool extractApk(const std::string& apk_path, const std::string& dest_dir)
 
         if (n.rfind("lib/arm64-v8a/", 0) == 0 && n.size() > 14 &&
             n.back() != '/') {
-            std::string dest = dest_dir + "/lib/" + n.substr(14);
-            compatLogFmt("extract lib: %s", n.substr(14).c_str());
+            std::string rel  = n.substr(14);
+            std::string dest = dest_dir + "/lib/" + rel;
+            compatLogFmt("extract lib: %s", rel.c_str());
+            if (cb) cb("Extracting APK", rel.c_str());
             extractEntry(zf, dest);
 
         } else if (n.rfind("assets/", 0) == 0 && n.back() != '/') {
             std::string rel  = n.substr(7);
             std::string dest = dest_dir + "/assets/" + rel;
-            // Create intermediate directories
             size_t p = 0;
             while ((p = rel.find('/', p)) != std::string::npos) {
                 mkdirp(dest_dir + "/assets/" + rel.substr(0, p));
@@ -109,14 +111,12 @@ static bool extractApk(const std::string& apk_path, const std::string& dest_dir)
     return true;
 }
 
-// ─── Find the main .so ───────────────────────────────────────────────────────
-// Scan the lib directory and find the .so that exports ANativeActivity_onCreate
-// or JNI_OnLoad (fallback: pick the largest file)
+// ─── Find the main .so ────────────────────────────────────────────────────────
 static std::string findMainSo(const std::string& lib_dir) {
     DIR* d = opendir(lib_dir.c_str());
     if (!d) return "";
 
-    std::vector<std::pair<size_t, std::string>> sos; // size, path
+    std::vector<std::pair<size_t, std::string>> sos;
     struct dirent* ent;
     while ((ent = readdir(d))) {
         std::string nm = ent->d_name;
@@ -130,12 +130,9 @@ static std::string findMainSo(const std::string& lib_dir) {
 
     if (sos.empty()) return "";
 
-    // Sort largest first (heuristic: main lib is usually biggest)
     std::sort(sos.begin(), sos.end(),
               [](const auto& a, const auto& b){ return a.first > b.first; });
 
-    // Return path of largest .so for now
-    // (we'll improve this to check exports in a later iteration)
     compatLogFmt("findMainSo: picked %s (%zu bytes)",
                  sos[0].second.c_str(), sos[0].first);
     return sos[0].second;
@@ -186,7 +183,6 @@ static bool setupEGL(ANativeWindow* win) {
         return false;
     }
 
-    // switch-mesa EGL accepts NWindow* as EGLNativeWindowType
     g_egl_surface = eglCreateWindowSurface(g_egl_display, cfg,
                                            (EGLNativeWindowType)win->nwin, nullptr);
     if (g_egl_surface == EGL_NO_SURFACE) {
@@ -204,48 +200,73 @@ static bool setupEGL(ANativeWindow* win) {
 }
 
 // ─── launchApk ───────────────────────────────────────────────────────────────
-bool launchApk(const std::string& apk_path, const std::string& pkg_name) {
-    // Open log file
+LaunchResult launchApk(const std::string& apk_path, const std::string& pkg_name,
+                       ProgressCb cb) {
+    LaunchResult result;
+
     std::string log_path = "sdmc:/BareDroidNX/compat_log.txt";
     g_compat_log = fopen(log_path.c_str(), "w");
     compatLogFmt("launchApk: %s  pkg=%s", apk_path.c_str(), pkg_name.c_str());
 
     // ── 1. Set up directories ────────────────────────────────────────────────
-    std::string base_dir = std::string("sdmc:/BareDroidNX/games/") + pkg_name;
-    std::string lib_dir  = base_dir + "/lib";
-    std::string asset_dir= base_dir + "/assets";
+    std::string base_dir  = std::string("sdmc:/BareDroidNX/games/") + pkg_name;
+    std::string lib_dir   = base_dir + "/lib";
+    std::string asset_dir = base_dir + "/assets";
     mkdirp(base_dir);
     mkdirp(lib_dir);
     mkdirp(asset_dir);
 
     // ── 2. Extract APK ───────────────────────────────────────────────────────
+    if (cb) cb("Extracting APK", "Reading libs and assets from APK...");
     compatLog("Extracting APK...");
-    if (!extractApk(apk_path, base_dir)) {
+    if (!extractApk(apk_path, base_dir, cb)) {
         compatLog("Extraction failed");
-        if (g_compat_log) fclose(g_compat_log);
-        return false;
+        result.errorStage  = "Extracting APK";
+        result.errorDetail = "Could not open or read the APK file.";
+        if (g_compat_log) { fclose(g_compat_log); g_compat_log = nullptr; }
+        return result;
     }
 
-    // ── 3. Find and load the main .so ────────────────────────────────────────
+    // ── 3. Find the main .so ─────────────────────────────────────────────────
+    if (cb) cb("Finding main library", "Scanning extracted libs...");
     std::string main_so = findMainSo(lib_dir);
     if (main_so.empty()) {
         compatLog("No arm64 .so found in APK");
-        if (g_compat_log) fclose(g_compat_log);
-        return false;
+        result.errorStage  = "Finding main library";
+        result.errorDetail = "No arm64-v8a .so found — APK may not support this architecture.";
+        if (g_compat_log) { fclose(g_compat_log); g_compat_log = nullptr; }
+        return result;
     }
 
+    // ── 4. Set up JNI ───────────────────────────────────────────────────────
+    if (cb) cb("Setting up JNI", "Preparing Android runtime environment...");
     compatLog("Setting up JNI environment...");
     jniSetup(&g_compat);
 
+    // ── 5. Load the ELF ─────────────────────────────────────────────────────
+    {
+        // Show just the filename, not the full SD card path
+        size_t sl = main_so.rfind('/');
+        std::string soName = (sl != std::string::npos) ? main_so.substr(sl + 1) : main_so;
+        if (cb) cb("Loading ELF library", soName.c_str());
+    }
     compatLog("Loading main library...");
     LoadedSo* so = elfLoad(main_so.c_str());
+    result.unresolved = elfGetUnresolvedCount();
     if (!so) {
         compatLog("ELF load failed");
-        if (g_compat_log) fclose(g_compat_log);
-        return false;
+        result.errorStage  = "Loading ELF library";
+        result.errorDetail = "ELF loader rejected the .so — may not be a valid ARM64 shared lib.";
+        if (g_compat_log) { fclose(g_compat_log); g_compat_log = nullptr; }
+        return result;
+    }
+    if (result.unresolved > 0) {
+        compatLogFmt("ELF: %d unresolved symbols (game may crash when those paths are hit)",
+                     result.unresolved);
     }
 
-    // ── 4. Set up ANativeWindow ───────────────────────────────────────────────
+    // ── 6. Set up ANativeWindow ──────────────────────────────────────────────
+    if (cb) cb("Setting up window", "Initialising display surface...");
     compatLog("Setting up window...");
     ANativeWindow* win = &g_compat.window;
     win->width  = 1280;
@@ -253,34 +274,40 @@ bool launchApk(const std::string& apk_path, const std::string& pkg_name) {
     win->format = 1; // RGBA_8888
     win->nwin   = nwindowGetDefault();
 
-    if (!setupEGL(win)) {
-        compatLog("EGL setup failed — continuing anyway");
-        // Don't return; some games set up EGL themselves
+    bool eglOk = setupEGL(win);
+    if (!eglOk) {
+        compatLog("EGL setup failed — continuing anyway (game may initialise EGL itself)");
     }
 
-    // ── 5. Set up ANativeActivity ─────────────────────────────────────────────
+    // Track svcSetMemoryPermission result — captured inside elfLoad via log; we
+    // read it back from the loader's last svc call by re-querying memory info.
+    // For now, store 0 (the elf_loader logs it; we'll surface it when we hook svc).
+    result.svcPermCode = 0;
+
+    // ── 7. Set up ANativeActivity ────────────────────────────────────────────
+    if (cb) cb("Setting up ANativeActivity", "Wiring Android activity callbacks...");
     compatLog("Setting up ANativeActivity...");
     ANativeActivity* act = &g_compat.activity;
     memset(&g_compat.callbacks, 0, sizeof(g_compat.callbacks));
-    act->callbacks         = &g_compat.callbacks;
-    act->vm                = (JavaVM*)g_compat.vm_outer;
-    act->env               = (JNIEnv*)g_compat.env_outer;
-    act->clazz             = (void*)0x4001; // fake Java object handle
-    act->internalDataPath  = base_dir.c_str();
-    act->externalDataPath  = base_dir.c_str();
-    act->sdkVersion        = 26;
-    act->instance          = nullptr;
-    act->window            = win;
+    act->callbacks        = &g_compat.callbacks;
+    act->vm               = (JavaVM*)g_compat.vm_outer;
+    act->env              = (JNIEnv*)g_compat.env_outer;
+    act->clazz            = (void*)0x4001;
+    act->internalDataPath = base_dir.c_str();
+    act->externalDataPath = base_dir.c_str();
+    act->sdkVersion       = 26;
+    act->instance         = nullptr;
+    act->window           = win;
 
-    // Set up asset manager pointing to extracted assets
     strncpy(g_compat.asset_mgr.base_path, asset_dir.c_str(),
             sizeof(g_compat.asset_mgr.base_path) - 1);
     act->assetManager = &g_compat.asset_mgr;
 
-    // ── 6. Call JNI_OnLoad if present ────────────────────────────────────────
+    // ── 8. Call JNI_OnLoad if present ────────────────────────────────────────
     typedef int32_t (*JNI_OnLoad_fn)(JavaVM**, void*);
     JNI_OnLoad_fn jni_onload = (JNI_OnLoad_fn)so->findSym("JNI_OnLoad");
     if (jni_onload) {
+        if (cb) cb("Calling JNI_OnLoad", "Initialising native library...");
         compatLog("Calling JNI_OnLoad...");
         int32_t ver = jni_onload((JavaVM**)g_compat.vm_outer, nullptr);
         compatLogFmt("JNI_OnLoad returned: 0x%X", ver);
@@ -288,45 +315,42 @@ bool launchApk(const std::string& apk_path, const std::string& pkg_name) {
         compatLog("JNI_OnLoad not found (OK for NativeActivity games)");
     }
 
-    // ── 7. Call ANativeActivity_onCreate ─────────────────────────────────────
+    // ── 9. Call ANativeActivity_onCreate ─────────────────────────────────────
     typedef void (*OnCreate_fn)(ANativeActivity*, void*, size_t);
     OnCreate_fn on_create = (OnCreate_fn)so->findSym("ANativeActivity_onCreate");
     if (!on_create) {
-        compatLog("ANativeActivity_onCreate not found — trying largest exported sym");
-        // Try other common entry points
-        on_create = (OnCreate_fn)so->findSym("Java_com_google_androidgamesdk_GameActivity_initializeNativeCode");
+        compatLog("ANativeActivity_onCreate not found — trying GameActivity entry point");
+        on_create = (OnCreate_fn)so->findSym(
+            "Java_com_google_androidgamesdk_GameActivity_initializeNativeCode");
         if (!on_create) {
             compatLog("No entry point found — cannot launch");
-            if (g_compat_log) fclose(g_compat_log);
-            return false;
+            result.errorStage  = "Finding entry point";
+            result.errorDetail = "ANativeActivity_onCreate not exported by this .so.";
+            if (g_compat_log) { fclose(g_compat_log); g_compat_log = nullptr; }
+            return result;
         }
     }
 
+    if (cb) cb("Calling ANativeActivity_onCreate", "Starting game logic...");
     compatLog("Calling ANativeActivity_onCreate...");
     on_create(act, nullptr, 0);
     compatLog("onCreate returned");
 
-    // ── 8. Drive lifecycle ────────────────────────────────────────────────────
-    ANativeActivityCallbacks* cb = &g_compat.callbacks;
-
-    if (cb->onStart)  { compatLog("onStart"); cb->onStart(act); }
-    if (cb->onResume) { compatLog("onResume"); cb->onResume(act); }
-    if (cb->onNativeWindowCreated) {
+    // ── 10. Drive lifecycle ───────────────────────────────────────────────────
+    ANativeActivityCallbacks* cbs = &g_compat.callbacks;
+    if (cbs->onStart)  { compatLog("onStart");  cbs->onStart(act); }
+    if (cbs->onResume) { compatLog("onResume"); cbs->onResume(act); }
+    if (cbs->onNativeWindowCreated) {
+        if (cb) cb("Running game", "Delivering window to game...");
         compatLog("onNativeWindowCreated");
-        cb->onNativeWindowCreated(act, win);
+        cbs->onNativeWindowCreated(act, win);
     }
 
-    // ── 9. Game loop ──────────────────────────────────────────────────────────
     compatLog("Entering game loop (game drives rendering via EGL)");
-    // The game's NativeActivity thread should now be driving the loop.
-    // Since we're single-threaded, we just spin and swap buffers.
-    // In a real implementation the game calls eglSwapBuffers itself.
-    // For now, just let the callbacks drive things.
-    // If the game spawned a thread (pt_create was called), it's a no-op,
-    // so the game is stuck. But we log so we can see what happened.
-    compatLog("Note: if game uses background threads they are stubbed out");
+    compatLog("Note: background threads are stubbed — game may appear frozen");
 
-    // Flush log and return
     if (g_compat_log) { fflush(g_compat_log); fclose(g_compat_log); g_compat_log = nullptr; }
-    return true;
+
+    result.ok = true;
+    return result;
 }
