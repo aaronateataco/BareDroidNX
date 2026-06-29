@@ -141,6 +141,22 @@ Even with all symbols resolved and code executable, the game could crash during 
 
 ---
 
+## Performance Expectations (Hill Climb Racing 1.67.0)
+
+We're testing the `.apk` release of **Hill Climb Racing 1.67.0** specifically — the current Play Store release ships as a `.xapk` (a zip-of-zips wrapper some third-party distributors use for split/expansion APKs). BareDroidNX's APK parser only understands plain `.apk` (zip) files right now, so `.xapk` support is out of scope until a later phase. Pinning to 1.67.0 keeps testing on a format we can actually ingest.
+
+There's no measured frame rate yet — the game hasn't booted far enough to render a single frame. Here's the theoretical ceiling based on the hardware alone:
+
+- Hill Climb Racing is a simple 2D vector-style physics game, originally tuned to hit 60 FPS on 2012-era phones with GPUs far weaker than the Switch's (Adreno 200/203, Mali-400MP class hardware).
+- The Switch's Tegra X1 (4× Cortex-A57 @ ~1020 MHz in handheld mode, Maxwell-based GPU) has roughly an order of magnitude more compute than HCR's original minimum-spec target. Raw rendering throughput should not be the bottleneck.
+- **Theoretical ceiling: a locked 60 FPS** — the same cap the game's own engine uses on Android — assuming it boots and renders at all.
+- The real risk to frame rate isn't the silicon, it's BareDroidNX's compat layer: `pthread_create` is currently stubbed (no real background thread), so any physics/render thread split the game relies on will serialize onto one thread; GLES calls are translated through switch-mesa rather than a native Android GPU driver, adding some per-draw-call overhead.
+- Docked vs handheld GPU clocks differ a lot on Switch, but it's moot here — the game requires touchscreen input, which only works in handheld mode, so handheld is the only mode worth benchmarking once it runs.
+
+This section gets replaced with real measured numbers once the game boots far enough to render a frame.
+
+---
+
 ## TODO / Roadmap
 
 > Items are roughly ordered by priority. "Phase 0" is the current work.
@@ -161,8 +177,9 @@ Even with all symbols resolved and code executable, the game could crash during 
 - [x] **Per-constructor logging** — each of the 417 `DT_INIT_ARRAY` constructors is logged (address + index) with an immediate flush before it's called, so the crash site shows in `compat_log.txt` when the Switch dies mid-constructor
 - [x] **Load all .so files** — all three libs loaded smallest-first so cross-library symbols are available before any constructors run
 - [x] **40+ new shims** — signal handling (`sigaction`, `sigemptyset/fill/add/del`, `pthread_sigmask`), thread naming (`pthread_setname_np`, `prctl`), process info (`gettid`, `getpid`, `getauxval`), memory (`mprotect`, `mmap/munmap`), barriers, `sleep`/`usleep`, `strtod_l`/`strtof_l`, `access`, `lstat`, `chmod`, `ioctl`, `pipe`, `dup/dup2`, `raise`, `kill`, `pthread_kill`, `__register_atfork`, `clock_nanosleep`
-- [ ] **Identify constructor crash** — need a new compat_log run; the last logged constructor before the crash is the culprit
-- [ ] Investigate and fix whatever the failing constructor is doing
+- [x] **Heap staging buffer for ELF loading** — segment copy, relocation, and dynamic parsing now happen on a plain heap buffer; only a single bulk `memcpy` touches JIT-writable memory, right before `jitTransitionToExecutable`. This fixed a hard crash on the very first write to JIT memory.
+- [x] **Per-relocation-entry logging + bounds checks in `applyRela`** — every RELA/JMPREL entry now logs its index, type, symbol index, and resolved name before being applied; `sym.st_name` is now bounds-checked against `DT_STRSZ` before being dereferenced as a string (the gap-derived `sym_count` heuristic can overrun into `.gnu.version` data sitting between `.dynsym` and `.dynstr`, producing garbage string pointers — this is the leading suspect for the current crash). `R_AARCH64_COPY` sizes are now capped at 64KB to guard against a bogus `st_size`. PT_LOAD segment copies and the `PT_DYNAMIC` pointer are now bounds-checked against the staging buffer too.
+- [ ] **Identify relocation crash** — need a new compat_log run; the last logged `RELA[n/3060]`/`JMPREL[n/...]` entry before the crash is the culprit
 - [ ] Real touch input delivery via `AInputQueue` / `ALooper`
 
 ### Phase 1 — Touch input
@@ -185,6 +202,11 @@ Even with all symbols resolved and code executable, the game could crash during 
 - [ ] Version bump system — each build increments `APP_VERSION`
 - [ ] Per-APK settings overlay (resolution, framerate cap)
 - [ ] APK delete / manage from the UI
+- [x] WebP icon decoding (`IMG_INIT_WEBP`) + WebP fallback candidates — many modern app icons ship as WebP, not PNG
+- [x] Linear texture scaling (`SDL_HINT_RENDER_SCALE_QUALITY`) for smoother icon downscaling
+- [x] Colored monogram placeholder (Android-style initial + hashed color) replaces the flat gray box when no icon is found
+- [x] Larger APK list icons (72px → 84px) and result-screen icon (96px → 112px)
+- [x] APK file size shown in the list (e.g. "42.1 MB")
 
 ### Not Planned (for now)
 
@@ -200,6 +222,10 @@ Even with all symbols resolved and code executable, the game could crash during 
 
 ### [Unreleased / Current Build]
 
+- [x] **Performance Expectations section** — theoretical 60 FPS ceiling for Hill Climb Racing 1.67.0 based on Tegra X1 vs. the game's original minimum-spec hardware, plus the `.apk` vs `.xapk` note explaining why we test 1.67.0 instead of the latest release
+- [x] **APK chooser QoL**: WebP icon decoding, linear icon scaling, colored monogram placeholders for missing icons, larger icons, file size shown per APK
+- [x] **Heap staging buffer for ELF loading** — fixed a hard crash on the first write to JIT-writable memory by doing all segment copy / relocation / dynamic parsing on a heap buffer, then a single bulk `memcpy` into JIT memory right before `jitTransitionToExecutable`
+- [x] **Per-relocation-entry logging + bounds checks** in `applyRela()` — logs every RELA/JMPREL entry's index/type/symbol before applying it, bounds-checks `sym.st_name` against `DT_STRSZ` (guards against the gap-derived `sym_count` overrunning into `.gnu.version` data), and caps `R_AARCH64_COPY` size at 64KB
 - [x] **Per-constructor logging** — `elfRunCtors()` logs each constructor address + index and flushes to `compat_log.txt` before calling it; the last logged entry before a Switch crash pinpoints the culprit
 - [x] **Load all .so files** — replaced `findMainSo` with `findAllSos`; all three libs are loaded smallest-first so cross-library symbol resolution works before any constructors run
 - [x] **40+ new shims** — `sigaction`, `sigemptyset`, `sigfillset`, `sigaddset`, `sigdelset`, `sigismember`, `pthread_sigmask`, `sigprocmask`, `prctl`, `gettid`, `getpid`, `getuid`, `getgid`, `getauxval`, `mprotect`, `mmap`, `munmap`, `pipe`, `dup`, `dup2`, `ioctl`, `access`, `chmod`, `fchmod`, `lstat`, `pthread_setname_np`, `pthread_getname_np`, `pthread_attr_setstack`, `pthread_barrier_*`, `kill`, `raise`, `pthread_kill`, `sleep`, `usleep`, `clock_nanosleep`, `strtod_l`, `strtof_l`, `__register_atfork`

@@ -85,16 +85,24 @@ static void* resolveSymbol(const char* name) {
 // These differ when using JIT dual-mapping; they're equal in the heap fallback.
 static void applyRela(LoadedSo* so, const Elf64_Rela* relas, size_t count,
                       uint8_t* write_base, uint8_t* exec_base,
-                      uint8_t* write_alloc, size_t alloc_size) {
+                      uint8_t* write_alloc, size_t alloc_size,
+                      uint64_t strsz, const char* tag) {
     for (size_t i = 0; i < count; i++) {
         const Elf64_Rela& r = relas[i];
         uint32_t sym_idx = ELF64_R_SYM(r.r_info);
         uint32_t type    = ELF64_R_TYPE(r.r_info);
 
+        compatLogFmt("%s[%zu/%zu] type=%u sym_idx=%u off=0x%llx addend=0x%llx",
+                     tag, i + 1, count, type, sym_idx,
+                     (unsigned long long)r.r_offset, (long long)r.r_addend);
+
         if (r.r_offset < so->min_vaddr) continue;
         uint8_t* target_ptr = write_base + r.r_offset;
-        if (target_ptr < write_alloc || target_ptr + 8 > write_alloc + alloc_size)
+        if (target_ptr < write_alloc || target_ptr + 8 > write_alloc + alloc_size) {
+            compatLogFmt("%s[%zu/%zu] WARN target 0x%llx out of stage bounds — skipped",
+                         tag, i + 1, count, (unsigned long long)r.r_offset);
             continue;
+        }
         uint64_t* target = (uint64_t*)target_ptr;
 
         if (type == R_AARCH64_RELATIVE) {
@@ -103,20 +111,44 @@ static void applyRela(LoadedSo* so, const Elf64_Rela* relas, size_t count,
         }
 
         if (!so->symtab || sym_idx == 0) continue;
-        if (sym_idx >= so->sym_count) continue;
+        if (sym_idx >= so->sym_count) {
+            compatLogFmt("%s[%zu/%zu] WARN sym_idx %u >= sym_count %u — skipped",
+                         tag, i + 1, count, sym_idx, so->sym_count);
+            continue;
+        }
 
         const Elf64_Sym& sym = so->symtab[sym_idx];
-        const char* sym_name = so->strtab ? (so->strtab + sym.st_name) : "";
+        compatLogFmt("%s[%zu/%zu] sym.st_name=%u st_value=0x%llx st_size=%llu st_shndx=%u",
+                     tag, i + 1, count, sym.st_name,
+                     (unsigned long long)sym.st_value, (unsigned long long)sym.st_size,
+                     sym.st_shndx);
+
+        // .gnu.version sits between .dynsym and .dynstr in most ELFs, which can
+        // inflate the gap-derived sym_count past the real symbol table. Guard
+        // st_name against strsz before treating it as a string pointer.
+        const char* sym_name = "";
+        if (so->strtab) {
+            if (strsz == 0 || sym.st_name < strsz) {
+                sym_name = so->strtab + sym.st_name;
+            } else {
+                compatLogFmt("%s[%zu/%zu] WARN st_name %u >= strsz %llu — name lookup skipped",
+                             tag, i + 1, count, sym.st_name, (unsigned long long)strsz);
+            }
+        }
 
         uint64_t sym_addr = 0;
         if (sym.st_shndx != SHN_UNDEF && sym.st_value != 0) {
             // Defined in this module — return its exec-side address
             sym_addr = (uint64_t)exec_base + sym.st_value;
         } else if (sym_name[0]) {
+            compatLogFmt("%s[%zu/%zu] resolving \"%s\"", tag, i + 1, count, sym_name);
             sym_addr = (uint64_t)resolveSymbol(sym_name);
             if (!sym_addr) {
                 compatLogFmt("ELF: unresolved: %s", sym_name);
                 g_unresolved_count++;
+            } else {
+                compatLogFmt("%s[%zu/%zu] resolved \"%s\" -> %p",
+                             tag, i + 1, count, sym_name, (void*)sym_addr);
             }
         }
 
@@ -131,11 +163,20 @@ static void applyRela(LoadedSo* so, const Elf64_Rela* relas, size_t count,
                 *target = sym_addr;
                 break;
             case R_AARCH64_COPY:
-                if (sym_addr && sym.st_size > 0)
-                    memcpy(target, (void*)sym_addr, sym.st_size);
+                if (sym_addr && sym.st_size > 0) {
+                    size_t csz = (size_t)sym.st_size;
+                    if (csz > 0x10000) {
+                        compatLogFmt("%s[%zu/%zu] WARN COPY size %zu capped to 0x10000",
+                                     tag, i + 1, count, csz);
+                        csz = 0x10000;
+                    }
+                    memcpy(target, (void*)sym_addr, csz);
+                }
                 break;
         }
+        compatLogFmt("%s[%zu/%zu] OK", tag, i + 1, count);
     }
+    compatLogFmt("%s: all %zu entries processed", tag, count);
 }
 
 // ─── elfLoad ──────────────────────────────────────────────────────────────────
@@ -251,8 +292,19 @@ LoadedSo* elfLoad(const char* path) {
     for (int i = 0; i < ehdr->e_phnum; i++) {
         const Elf64_Phdr& ph = phdrs[i];
         if (ph.p_type != PT_LOAD || ph.p_filesz == 0) continue;
-        if (ph.p_offset + ph.p_filesz > fsize) continue;
-        memcpy(stage_base + ph.p_vaddr, file_data + ph.p_offset, ph.p_filesz);
+        if (ph.p_offset + ph.p_filesz > fsize) {
+            compatLogFmt("ELF: seg[%d] WARN offset+filesz exceeds file size — skipped", i);
+            continue;
+        }
+        uint8_t* seg_dst = stage_base + ph.p_vaddr;
+        if (seg_dst < stage || seg_dst + ph.p_filesz > stage + alloc_size) {
+            compatLogFmt("ELF: seg[%d] WARN dest out of stage bounds — skipped", i);
+            continue;
+        }
+        compatLogFmt("ELF: seg[%d] vaddr=0x%llx filesz=0x%llx memsz=0x%llx flags=0x%x",
+                     i, (unsigned long long)ph.p_vaddr, (unsigned long long)ph.p_filesz,
+                     (unsigned long long)ph.p_memsz, ph.p_flags);
+        memcpy(seg_dst, file_data + ph.p_offset, ph.p_filesz);
     }
     compatLog("ELF: segs copied to stage");
 
@@ -265,7 +317,12 @@ LoadedSo* elfLoad(const char* path) {
 
     for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdrs[i].p_type != PT_DYNAMIC) continue;
-        const Elf64_Dyn* dyn = (const Elf64_Dyn*)(stage_base + phdrs[i].p_vaddr);
+        uint8_t* dyn_ptr = stage_base + phdrs[i].p_vaddr;
+        if (dyn_ptr < stage || dyn_ptr >= stage + alloc_size) {
+            compatLogFmt("ELF: PT_DYNAMIC out of stage bounds — skipping dynamic parse");
+            break;
+        }
+        const Elf64_Dyn* dyn = (const Elf64_Dyn*)dyn_ptr;
         for (int d = 0; d < 4096 && dyn->d_tag != DT_NULL; dyn++, d++) {
             switch (dyn->d_tag) {
                 case DT_STRTAB:      strtab_vaddr   = dyn->d_un.d_ptr; break;
@@ -321,14 +378,14 @@ LoadedSo* elfLoad(const char* path) {
         compatLogFmt("ELF: rela %llu entries", (unsigned long long)(rela_sz / sizeof(Elf64_Rela)));
         applyRela(so, (const Elf64_Rela*)(stage_base + rela_vaddr),
                   rela_sz / sizeof(Elf64_Rela),
-                  stage_base, exec_base, stage, alloc_size);
+                  stage_base, exec_base, stage, alloc_size, strsz, "RELA");
     }
     compatLog("ELF: rela done");
     if (jmprel_vaddr && jmprel_sz && so->symtab) {
         compatLogFmt("ELF: jmprel %llu entries", (unsigned long long)(jmprel_sz / sizeof(Elf64_Rela)));
         applyRela(so, (const Elf64_Rela*)(stage_base + jmprel_vaddr),
                   jmprel_sz / sizeof(Elf64_Rela),
-                  stage_base, exec_base, stage, alloc_size);
+                  stage_base, exec_base, stage, alloc_size, strsz, "JMPREL");
     }
     compatLog("ELF: jmprel done");
 

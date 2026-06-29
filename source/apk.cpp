@@ -1,6 +1,7 @@
 #include "apk.h"
 #include <minizip/unzip.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include <algorithm>
 #include <cstring>
 
@@ -303,6 +304,9 @@ ApkInfo parseApk(const std::string& path) {
         ? info.filename.substr(0, info.filename.size() - 4)
         : info.filename;
 
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) info.fileSizeBytes = (uint64_t)st.st_size;
+
     unzFile zf = unzOpen(path.c_str());
     if (!zf) return info;
 
@@ -347,6 +351,13 @@ ApkInfo parseApk(const std::string& path) {
             "res/drawable-xxxhdpi/ic_launcher.png",
             "res/drawable-xxhdpi/ic_launcher.png",
             "res/drawable/ic_launcher.png",
+            // WebP variants — common for modern app icons
+            "res/mipmap-xxxhdpi-v4/ic_launcher.webp",
+            "res/mipmap-xxhdpi-v4/ic_launcher.webp",
+            "res/mipmap-xhdpi-v4/ic_launcher.webp",
+            "res/mipmap-hdpi-v4/ic_launcher.webp",
+            "res/mipmap-xxxhdpi/ic_launcher.webp",
+            "res/mipmap-xxhdpi/ic_launcher.webp",
             nullptr
         };
         for (int i = 0; CANDIDATES[i]; i++) {

@@ -9,6 +9,7 @@ struct ApkInfo {
     std::string packageName;
     std::string versionName;
     std::vector<uint8_t> iconPng;
+    uint64_t    fileSizeBytes = 0;
 };
 
 ApkInfo              parseApk (const std::string& path);

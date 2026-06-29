@@ -3,6 +3,7 @@
 #include <SDL2/SDL_image.h>
 #include <SDL2/SDL_ttf.h>
 #include <sys/stat.h>
+#include <cctype>
 #include <cstdio>
 #include <algorithm>
 #include <string>
@@ -23,9 +24,9 @@ static const int HEADER_H = 72;
 static const int FOOTER_H = 48;
 static const int LIST_Y   = HEADER_H;
 static const int LIST_H   = SH - HEADER_H - FOOTER_H;
-static const int ITEM_H   = 100;
-static const int ICON_SZ  = 72;
-static const int VISIBLE  = LIST_H / ITEM_H;   // 6 items
+static const int ITEM_H   = 108;
+static const int ICON_SZ  = 84;
+static const int VISIBLE  = LIST_H / ITEM_H;   // 5 items
 
 // Colors
 static const SDL_Color C_BG     = {15,  15,  26,  255};
@@ -36,7 +37,6 @@ static const SDL_Color C_DIV    = {35,  35,  65,  255};
 static const SDL_Color C_WHITE  = {255, 255, 255, 255};
 static const SDL_Color C_GRAY   = {160, 160, 180, 255};
 static const SDL_Color C_DIM    = {100, 100, 120, 255};
-static const SDL_Color C_ICON_PH= {50,  50,  75,  255};
 static const SDL_Color C_OK     = {80,  200, 80,  255};
 static const SDL_Color C_ERR    = {220, 80,  80,  255};
 static const SDL_Color C_WARN   = {220, 180, 60,  255};
@@ -111,7 +111,9 @@ struct App {
         }
         logMsg("SDL_Init OK");
 
-        if (IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG) == 0)
+        SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+
+        if (IMG_Init(IMG_INIT_PNG | IMG_INIT_JPG | IMG_INIT_WEBP) == 0)
             logSDL("IMG_Init warning");
         if (TTF_Init() != 0) {
             logSDL("TTF_Init failed"); logClose(); return false;
@@ -190,6 +192,40 @@ struct App {
         return w;
     }
 
+    static std::string formatSize(uint64_t bytes) {
+        char buf[32];
+        if (bytes >= 1024ull * 1024 * 1024)
+            snprintf(buf, sizeof(buf), "%.1f GB", bytes / (1024.0 * 1024 * 1024));
+        else if (bytes >= 1024ull * 1024)
+            snprintf(buf, sizeof(buf), "%.1f MB", bytes / (1024.0 * 1024));
+        else if (bytes >= 1024ull)
+            snprintf(buf, sizeof(buf), "%.0f KB", bytes / 1024.0);
+        else
+            snprintf(buf, sizeof(buf), "%llu B", (unsigned long long)bytes);
+        return buf;
+    }
+
+    // Android-style colored monogram placeholder for APKs with no usable icon —
+    // a flat gray box doesn't read as "app" the way a colored initial does.
+    void drawMonogram(const std::string& name, int x, int y, int sz) {
+        static const SDL_Color PALETTE[] = {
+            {239, 83,  80,  255}, {171, 71,  188, 255}, {66,  165, 245, 255},
+            {38,  166, 154, 255}, {255, 167, 38,  255}, {126, 87,  194, 255},
+            {92,  107, 192, 255}, {255, 112, 67,  255},
+        };
+        uint32_t h = 2166136261u;
+        for (char c : name) h = (h ^ (uint8_t)c) * 16777619u;
+        SDL_Color bg = PALETTE[h % (sizeof(PALETTE) / sizeof(PALETTE[0]))];
+
+        fill(x, y, sz, sz, bg);
+
+        char letter = name.empty() ? '?' : (char)toupper((unsigned char)name[0]);
+        std::string s(1, letter);
+        int w = 0, h2 = 0;
+        TTF_SizeUTF8(fLg, s.c_str(), &w, &h2);
+        drawText(fLg, s, C_WHITE, x + (sz - w) / 2, y + (sz - h2) / 2);
+    }
+
     std::string clamp(TTF_Font* f, const std::string& s, int maxW) {
         int w = 0, h = 0;
         TTF_SizeUTF8(f, s.c_str(), &w, &h);
@@ -262,17 +298,19 @@ struct App {
                     SDL_Rect dst = {20, iconY, ICON_SZ, ICON_SZ};
                     SDL_RenderCopy(rdr, icons[i], nullptr, &dst);
                 } else {
-                    fill(20, iconY, ICON_SZ, ICON_SZ, C_ICON_PH);
+                    drawMonogram(apks[i].appName, 20, iconY, ICON_SZ);
                 }
 
                 int tx   = 20 + ICON_SZ + 16;
                 int maxW = SW - tx - 30;
-                drawText(fLg, clamp(fLg, apks[i].appName, maxW), C_WHITE, tx, iy + 16);
+                drawText(fLg, clamp(fLg, apks[i].appName, maxW), C_WHITE, tx, iy + 14);
 
                 std::string pkgLine =
                     (apks[i].packageName.empty() ? apks[i].filename : apks[i].packageName);
                 if (!apks[i].versionName.empty())
                     pkgLine += "  v" + apks[i].versionName;
+                if (apks[i].fileSizeBytes > 0)
+                    pkgLine += "  ·  " + formatSize(apks[i].fileSizeBytes);
                 drawText(fSm, clamp(fSm, pkgLine, maxW), C_GRAY, tx, iy + 58);
             }
             // Scrollbar
@@ -347,10 +385,12 @@ struct App {
             drawText(fLg, "BareDroidNX", C_WHITE, 30, (HEADER_H - 28) / 2);
 
             // Game icon (small)
-            int iconSz = 96;
+            int iconSz = 112;
             if (idx < (int)icons.size() && icons[idx]) {
                 SDL_Rect dst = {(SW - iconSz) / 2, LIST_Y + 16, iconSz, iconSz};
                 SDL_RenderCopy(rdr, icons[idx], nullptr, &dst);
+            } else {
+                drawMonogram(apk.appName, (SW - iconSz) / 2, LIST_Y + 16, iconSz);
             }
 
             // Game name
