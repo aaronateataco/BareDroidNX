@@ -105,6 +105,7 @@ struct LoadedSo {
     const char*  strtab;
     Elf64_Sym*   symtab;
     uint32_t     sym_count;
+    uint64_t     strsz = 0;  // DT_STRSZ — bounds-checked in findSym against st_name
 
     // DT_INIT_ARRAY: stored here so constructors can be run after all SOs load
     InitFn*  init_arr       = nullptr;

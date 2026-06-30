@@ -57,6 +57,11 @@ void* LoadedSo::findSym(const char* name) const {
     for (uint32_t i = 1; i < sym_count; i++) {
         const Elf64_Sym& s = symtab[i];
         if (s.st_shndx == SHN_UNDEF || s.st_value == 0) continue;
+        // sym_count is derived from the gap between .dynsym and .dynstr, which
+        // often includes .gnu.version bytes interpreted as fake Elf64_Sym entries.
+        // Those fake entries can have wild st_name values that walk off the end
+        // of the string table — guard before dereferencing.
+        if (strsz > 0 && (uint64_t)s.st_name >= strsz) continue;
         const char* sname = strtab + s.st_name;
         if (strcmp(sname, name) == 0)
             return base + s.st_value;
@@ -359,6 +364,7 @@ LoadedSo* elfLoad(const char* path) {
 
     uint32_t sym_count = 0;
     if (strtab_vaddr) so->strtab = (const char*)(stage_base + strtab_vaddr);
+    so->strsz = strsz;
     if (symtab_vaddr && strtab_vaddr && syment) {
         so->symtab = (Elf64_Sym*)(stage_base + symtab_vaddr);
         if (strtab_vaddr > symtab_vaddr)
@@ -366,7 +372,7 @@ LoadedSo* elfLoad(const char* path) {
         if (sym_count > 200000) sym_count = 200000;
         so->sym_count = sym_count;
     }
-    compatLogFmt("ELF: so built sym_count=%u", sym_count);
+    compatLogFmt("ELF: so built sym_count=%u strsz=%llu", sym_count, (unsigned long long)strsz);
 
     // Register now so cross-library resolution works during relocation
     g_loaded_sos.push_back(so);
