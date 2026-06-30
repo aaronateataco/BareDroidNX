@@ -109,6 +109,10 @@ all: $(BUILD)
 
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@
+	@NEW=$$(( $$(cat $(CURDIR)/build_number.txt 2>/dev/null || echo 0) + 1 )); \
+	 echo $$NEW > $(CURDIR)/build_number.txt; \
+	 printf '#pragma once\n#define BUILD_NUMBER %d\n#define BUILD_VERSION "testing-alpha-%d"\n' $$NEW $$NEW \
+	   > $(CURDIR)/include/build_number.h
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
 clean:

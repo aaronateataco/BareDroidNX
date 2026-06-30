@@ -11,6 +11,7 @@
 
 #include "apk.h"
 #include "compat/loader.h"
+#include "build_number.h"
 
 static const char* APK_DIR  = "sdmc:/BareDroidNX/apks";
 static const char* LOG_FILE = "sdmc:/BareDroidNX/log.txt";
@@ -272,6 +273,11 @@ struct App {
         // Header
         fill(0, 0, SW, HEADER_H, C_HEADER);
         drawText(fLg, "BareDroidNX", C_WHITE, 30, (HEADER_H - 28) / 2);
+        {
+            int tw = 0, th = 0;
+            TTF_SizeUTF8(fLg, "BareDroidNX", &tw, &th);
+            drawText(fSm, BUILD_VERSION, C_DIM, 30 + tw + 14, (HEADER_H + 4) / 2);
+        }
         if (!apks.empty()) {
             std::string cnt = std::to_string(apks.size()) +
                               (apks.size() == 1 ? " APK" : " APKs");
