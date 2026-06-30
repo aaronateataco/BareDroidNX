@@ -162,8 +162,11 @@ void* LoadedSo::findSym(const char* name) const {
         // of the string table — guard before dereferencing.
         if (strsz > 0 && (uint64_t)s.st_name >= strsz) continue;
         const char* sname = strtab + s.st_name;
-        if (strcmp(sname, name) == 0)
+        if (strcmp(sname, name) == 0) {
+            if (data_alloc && data_vaddr > 0 && s.st_value >= data_vaddr)
+                return data_alloc + (s.st_value - data_vaddr);
             return base + s.st_value;
+        }
     }
     return nullptr;
 }
@@ -181,6 +184,53 @@ static void* resolveSymbol(const char* name) {
 
     // Fall back to our shim table (libc, GLES, EGL, libandroid, etc.)
     return shimResolve(name);
+}
+
+// ─── ADRP data-segment redirect ───────────────────────────────────────────────
+// Scans code_buf (the writable copy of the code segment, size code_size words),
+// finds ADRP instructions whose natural runtime target falls in the phantom data
+// range [phantom_data_start, phantom_data_end), and rewrites them to land in the
+// separate data_jit allocation at data_rx instead.  Both allocations are in the
+// same svcMapCodeMemory code-region VA band, so the delta fits in ADRP ±4 GB.
+static void patchAdrpToDataJit(uint8_t* code_buf, size_t code_size,
+                                uint64_t code_rx,
+                                uint64_t phantom_data_start,
+                                uint64_t phantom_data_end,
+                                uint64_t data_rx) {
+    uint32_t* words  = (uint32_t*)code_buf;
+    size_t    nwords = code_size / 4;
+    int       patched = 0, skipped = 0;
+    for (size_t i = 0; i < nwords; i++) {
+        uint32_t insn = words[i];
+        if ((insn & 0x9F000000u) != 0x90000000u) continue;  // not ADRP
+
+        uint64_t pc      = code_rx + (uint64_t)i * 4;
+        uint64_t pc_page = pc & ~0xfffULL;
+
+        int64_t immhi = (int64_t)((insn >> 5) & 0x7ffff);
+        int64_t immlo = (int64_t)((insn >> 29) & 3);
+        int64_t imm21 = (immhi << 2) | immlo;
+        if (imm21 & (1LL << 20)) imm21 -= (1LL << 21);
+
+        uint64_t tgt_page = (uint64_t)((int64_t)pc_page + imm21 * 4096LL);
+        if (tgt_page < phantom_data_start || tgt_page >= phantom_data_end) continue;
+
+        uint64_t off_in_data = tgt_page - phantom_data_start;
+        uint64_t new_tgt     = data_rx + off_in_data;
+        int64_t  new_imm21   = ((int64_t)new_tgt - (int64_t)pc_page) / 4096LL;
+
+        if (new_imm21 < -(1 << 20) || new_imm21 >= (1 << 20)) { ++skipped; continue; }
+
+        uint32_t nlo = (uint32_t)(new_imm21 & 3);
+        uint32_t nhi = (uint32_t)((new_imm21 >> 2) & 0x7ffff);
+        words[i] = (insn & 0x9F00001Fu) | (nlo << 29) | (nhi << 5);
+        ++patched;
+    }
+    compatLogFmt("ADRP→data_jit: %d patched %d skipped (code_rx=%p data_rx=0x%llx phantom=0x%llx..0x%llx)",
+                 patched, skipped, (void*)code_rx,
+                 (unsigned long long)data_rx,
+                 (unsigned long long)phantom_data_start,
+                 (unsigned long long)phantom_data_end);
 }
 
 // ─── RELA relocation processing ───────────────────────────────────────────────
@@ -341,49 +391,72 @@ LoadedSo* elfLoad(const char* path) {
 
     size_t alloc_size = (size_t)ALIGN_UP(max_vaddr - min_vaddr, 0x1000);
 
-    // ── Allocate code memory via JIT API ─────────────────────────────────────
-    // jitCreate() uses svcMapCodeMemory internally, which creates a dual-view
-    // mapping: a writable (src_addr) side and an executable (dst_addr) side.
-    // This is necessary because heap memory (memalign) cannot be made Rx via
-    // svcSetMemoryPermission on Switch (returns 0xD801).
-    Jit    jit_mem   = {};
-    bool   using_jit = false;
-    uint8_t* write_alloc = nullptr;  // writable mapping (RW)
-    uint8_t* exec_alloc  = nullptr;  // executable mapping (Rx)
+    // Page-aligned split between code and data segments.
+    // data_off_pg == 0 means no separate data segment (single JIT allocation).
+    uint64_t data_off_pg = 0;
+    if (data_seg_vaddr != UINT64_MAX && data_seg_vaddr > min_vaddr)
+        data_off_pg = ALIGN_DOWN(data_seg_vaddr - min_vaddr, 0x1000);
+    size_t code_jit_size = (data_off_pg > 0) ? (size_t)data_off_pg : alloc_size;
+    size_t data_jit_size = alloc_size - code_jit_size;
 
-    Result jit_rc = jitCreate(&jit_mem, alloc_size);
+    // ── Allocate JIT regions ──────────────────────────────────────────────────
+    // We create TWO svcMapCodeMemory allocations when there is a writable data
+    // segment: one for code (promoted to Rx) and one for data (kept Rw).
+    // Both rx_addrs land in the same code-region VA band of the process, so
+    // they are close enough for ADRP ±4 GB patching to work.
+    Jit      code_jit = {}, data_jit = {};
+    bool     using_jit      = false;
+    bool     using_data_jit = false;
+    uint8_t* code_write = nullptr;  // code_jit writable side
+    uint8_t* code_exec  = nullptr;  // code_jit rx_addr (→ Rx after transition)
+    uint8_t* data_write = nullptr;  // data_jit writable side
+    uint8_t* data_exec  = nullptr;  // data_jit rx_addr (stays Rw permanently)
+
+    Result jit_rc = jitCreate(&code_jit, code_jit_size);
     if (R_SUCCEEDED(jit_rc)) {
-        Result w_rc = jitTransitionToWritable(&jit_mem);
+        Result w_rc = jitTransitionToWritable(&code_jit);
         if (R_SUCCEEDED(w_rc)) {
-            using_jit   = true;
-            write_alloc = (uint8_t*)jit_mem.rw_addr;  // writable mapping
-            exec_alloc  = (uint8_t*)jit_mem.rx_addr;  // executable mapping
-            compatLogFmt("JIT: alloc OK write=%p exec=%p size=0x%zx",
-                         (void*)write_alloc, (void*)exec_alloc, alloc_size);
+            using_jit  = true;
+            code_write = (uint8_t*)code_jit.rw_addr;
+            code_exec  = (uint8_t*)code_jit.rx_addr;
+            compatLogFmt("JIT: code write=%p exec=%p size=0x%zx",
+                         (void*)code_write, (void*)code_exec, code_jit_size);
         } else {
-            compatLogFmt("JIT: jitTransitionToWritable failed 0x%08X", w_rc);
-            jitClose(&jit_mem);
+            compatLogFmt("JIT: code jitTransitionToWritable 0x%08X", w_rc);
+            jitClose(&code_jit);
         }
     } else {
-        compatLogFmt("JIT: jitCreate failed 0x%08X — falling back to heap (not executable)", jit_rc);
+        compatLogFmt("JIT: code jitCreate 0x%08X — heap fallback", (uint32_t)jit_rc);
     }
 
     if (!using_jit) {
-        // Heap fallback: code won't be executable, but we can still log unresolved symbols.
-        write_alloc = exec_alloc = (uint8_t*)memalign(0x1000, alloc_size);
-        if (!write_alloc) { free(file_data); compatLog("ELF: memalign failed"); return nullptr; }
+        code_write = code_exec = (uint8_t*)memalign(0x1000, alloc_size);
+        if (!code_write) { free(file_data); compatLog("ELF: memalign failed"); return nullptr; }
+    } else if (data_jit_size > 0) {
+        Result d_rc = jitCreate(&data_jit, data_jit_size);
+        if (R_SUCCEEDED(d_rc)) {
+            d_rc = jitTransitionToWritable(&data_jit);
+            if (R_SUCCEEDED(d_rc)) {
+                using_data_jit = true;
+                data_write = (uint8_t*)data_jit.rw_addr;
+                data_exec  = (uint8_t*)data_jit.rx_addr;
+                compatLogFmt("JIT: data write=%p exec=%p size=0x%zx (stays Rw)",
+                             (void*)data_write, (void*)data_exec, data_jit_size);
+            } else {
+                compatLogFmt("JIT: data jitTransitionToWritable 0x%08X", (uint32_t)d_rc);
+                jitClose(&data_jit);
+            }
+        } else {
+            compatLogFmt("JIT: data jitCreate 0x%08X — data writes will fault", (uint32_t)d_rc);
+        }
     }
 
-    // ── Use heap staging buffer so JIT memory is only touched once ──────────
-    // All ELF processing (segment copy, relocation) happens on a heap buffer.
-    // Only one bulk memcpy goes to the JIT writable region, right before
-    // jitTransitionToExecutable.  This avoids random small writes to JIT pages,
-    // which can fault on some Switch firmware if the mapping state is unexpected.
+    // ── Heap staging buffer ───────────────────────────────────────────────────
     uint8_t* stage = (uint8_t*)malloc(alloc_size);
     if (!stage) {
         compatLog("ELF: malloc staging buffer OOM");
-        if (using_jit) jitClose(&jit_mem);
-        else           free(write_alloc);
+        if (using_jit) { jitClose(&code_jit); if (using_data_jit) jitClose(&data_jit); }
+        else           free(code_write);
         free(file_data);
         return nullptr;
     }
@@ -391,9 +464,10 @@ LoadedSo* elfLoad(const char* path) {
     memset(stage, 0, alloc_size);
     compatLog("ELF: stage zeroed");
 
-    // stage_base: same offset math as write_base but in heap memory
+    // exec_base: used for GOT entries that reference CODE symbols.
+    // Data symbols are at data_exec+offset (handled after relocations via remapping).
     uint8_t* stage_base = stage - min_vaddr;
-    uint8_t* exec_base  = exec_alloc - min_vaddr;  // exec-side addresses for GOT
+    uint8_t* exec_base  = code_exec - min_vaddr;
 
     // ── Copy PT_LOAD segments into staging buffer ────────────────────────────
     for (int i = 0; i < ehdr->e_phnum; i++) {
@@ -459,12 +533,15 @@ LoadedSo* elfLoad(const char* path) {
     // ── Build LoadedSo — strtab/symtab point into staging buffer ─────────────
     LoadedSo* so = new LoadedSo();
     so->using_jit   = using_jit;
-    so->jit_mem     = jit_mem;
-    so->alloc       = exec_alloc;
-    so->write_alloc = write_alloc;
+    so->jit_mem     = code_jit;
+    so->alloc       = code_exec;
+    so->write_alloc = code_write;
+    so->data_alloc  = data_exec;   // nullptr if single-jit
     so->alloc_size  = alloc_size;
     so->min_vaddr   = min_vaddr;
-    so->data_vaddr  = (data_seg_vaddr != UINT64_MAX) ? data_seg_vaddr : 0;
+    // data_vaddr stores the page-aligned vaddr base of the data_jit allocation,
+    // used by findSym to route data-segment symbols to data_exec.
+    so->data_vaddr  = using_data_jit ? (min_vaddr + data_off_pg) : 0;
     so->base        = exec_base;
     so->path        = path;
 
@@ -520,79 +597,94 @@ LoadedSo* elfLoad(const char* path) {
     }
     compatLog("ELF: strtab/symtab copied");
 
-    // ── Bulk-copy staging buffer into JIT writable region ────────────────────
-    // Only one memcpy to JIT memory, avoiding many small random writes.
+    // ── Post-relocation: remap phantom data pointers → data_exec ─────────────
+    // Relocations above used exec_base = code_exec − min_vaddr, so any
+    // R_AARCH64_RELATIVE / local-symbol address that falls in the data segment
+    // will have been written as (code_exec + data_vaddr_offset), which is a
+    // "phantom" address (code pages, not the real data_jit allocation).
+    // Scan the data portion of stage and fix up those 64-bit pointers.
+    if (using_data_jit) {
+        uint64_t ph_start = (uint64_t)code_exec + data_off_pg;
+        uint64_t ph_end   = (uint64_t)code_exec + alloc_size;
+        uint64_t* scan    = (uint64_t*)(stage + data_off_pg);
+        size_t    nscan   = data_jit_size / 8;
+        int       remapped = 0;
+        for (size_t i = 0; i < nscan; i++) {
+            uint64_t v = scan[i];
+            if (v >= ph_start && v < ph_end) {
+                scan[i] = (uint64_t)data_exec + (v - ph_start);
+                ++remapped;
+            }
+        }
+        compatLogFmt("data-ptr remap: %d entries (phantom=0x%llx..0x%llx → data_rx=%p)",
+                     remapped, (unsigned long long)ph_start,
+                     (unsigned long long)ph_end, (void*)data_exec);
+
+        // ── ADRP patch: redirect code→data ADRP instructions ─────────────
+        // ADRP instructions in the code segment will compute addresses in the
+        // phantom range (code_exec + data_off_pg ...). Patch them to land in
+        // data_exec instead, which is the actual Rw data allocation.
+        patchAdrpToDataJit(stage, code_jit_size,
+                           (uint64_t)code_exec,
+                           ph_start, ph_end,
+                           (uint64_t)data_exec);
+    }
+
+    // ── Copy stage → JIT regions ─────────────────────────────────────────────
     if (using_jit) {
-        compatLogFmt("ELF: copying stage->JIT rw=%p size=0x%zx", (void*)write_alloc, alloc_size);
-        memcpy(write_alloc, stage, alloc_size);
-        compatLog("ELF: stage->JIT copy done");
+        compatLogFmt("ELF: copy code→JIT write=%p size=0x%zx", (void*)code_write, code_jit_size);
+        memcpy(code_write, stage, code_jit_size);
+        if (using_data_jit) {
+            compatLogFmt("ELF: copy data→JIT write=%p size=0x%zx", (void*)data_write, data_jit_size);
+            memcpy(data_write, stage + data_off_pg, data_jit_size);
+        }
     }
     free(stage);
     compatLog("ELF: stage freed");
 
-    // ── Transition code pages to Rx, leave data pages Rw ────────────────────
-    // After jitTransitionToWritable all exec pages are MemType_CodeOut (Rw).
-    // jitTransitionToExecutable would promote ALL pages to MemType_Code (Rx),
-    // after which the kernel refuses to demote a subset back to Rw (0xD401).
-    //
-    // Instead, when there is a writable data segment, skip jitTransitionToExecutable
-    // and call svcSetMemoryPermission on only the CODE pages to make them Rx.
-    // The data pages stay MemType_CodeOut (Rw), so game code running in the code
-    // pages can write to globals at their natural exec-side addresses without fault.
+    // ── Transition code_jit to Rx; data_jit stays Rw ─────────────────────────
     uint32_t this_svc_perm_code = 0;
     if (using_jit) {
-        Result exec_rc;
-        if (data_seg_vaddr != UINT64_MAX && data_seg_vaddr > min_vaddr) {
-            // Page-align the code/data boundary (always a whole-page split in ELF).
-            uint64_t code_end_pg = ALIGN_DOWN(data_seg_vaddr - min_vaddr, 0x1000);
-            exec_rc = svcSetMemoryPermission(exec_alloc, (size_t)code_end_pg, Perm_Rx);
-            compatLogFmt("JIT: code-only Rx: rc=0x%08X exec=%p code_size=0x%llx",
-                         (uint32_t)exec_rc, (void*)exec_alloc,
-                         (unsigned long long)code_end_pg);
-            if (R_SUCCEEDED(exec_rc))
-                compatLog("JIT: data pages remain Rw — writes will succeed");
-            else
-                compatLogFmt("JIT: WARN code-only Rx failed — falling back to full jitTransitionToExecutable");
-        } else {
-            exec_rc = MAKERESULT(1, 1);  // force fallback path
-        }
-
-        if (R_FAILED(exec_rc)) {
-            // Fallback: promote the entire region to Rx via the standard JIT API.
-            exec_rc = jitTransitionToExecutable(&jit_mem);
-            compatLogFmt("JIT: full Rx fallback: rc=0x%08X", (uint32_t)exec_rc);
-        }
-
-        so->jit_mem = jit_mem;
+        Result exec_rc = jitTransitionToExecutable(&code_jit);
+        so->jit_mem = code_jit;
         this_svc_perm_code = (uint32_t)exec_rc;
         if (R_FAILED(exec_rc))
-            compatLogFmt("JIT: transition failed: 0x%08X", exec_rc);
+            compatLogFmt("JIT: code jitTransitionToExecutable failed 0x%08X", exec_rc);
+        else
+            compatLogFmt("JIT: code Rx OK%s",
+                         using_data_jit ? "; data_jit stays Rw" : "");
     } else {
-        this_svc_perm_code = 0xD801;  // heap fallback — not executable
+        this_svc_perm_code = 0xD801;
     }
-    // Accumulate into global (capture first failure, 0 = all OK so far)
     if (g_last_svc_perm_code == 0 && this_svc_perm_code != 0)
         g_last_svc_perm_code = this_svc_perm_code;
 
-    // Flush CPU instruction cache over exec region
-    __builtin___clear_cache((char*)exec_alloc, (char*)exec_alloc + alloc_size);
+    __builtin___clear_cache((char*)code_exec, (char*)code_exec + code_jit_size);
 
-    // ── Store DT_INIT_ARRAY for deferred constructor run ────────────────────
-    // Constructors are run AFTER all SOs in the batch are loaded (via elfRunCtors),
-    // so cross-library symbols are available.  Only store if JIT succeeded.
+    // ── Store DT_INIT / DT_INIT_ARRAY for deferred constructor run ──────────
+    // Helper: convert a vaddr to its runtime exec address, accounting for the
+    // split between code_exec and data_exec.
+    auto vaddr_to_exec = [&](uint64_t vaddr) -> uint8_t* {
+        uint64_t rel = vaddr - min_vaddr;
+        if (using_data_jit && rel >= data_off_pg)
+            return data_exec + (rel - data_off_pg);
+        return code_exec + rel;
+    };
+
     if (init_fn_vaddr && using_jit && this_svc_perm_code == 0) {
-        so->init_fn = (LoadedSo::InitFn)(exec_base + init_fn_vaddr);
+        so->init_fn = (LoadedSo::InitFn)vaddr_to_exec(init_fn_vaddr);
         compatLogFmt("ELF: DT_INIT fn deferred @%p", (void*)so->init_fn);
     }
     if (init_arr_vaddr && init_arr_sz && using_jit && this_svc_perm_code == 0) {
-        so->init_arr       = (LoadedSo::InitFn*)(exec_base + init_arr_vaddr);
+        so->init_arr       = (LoadedSo::InitFn*)vaddr_to_exec(init_arr_vaddr);
         so->init_arr_count = init_arr_sz / sizeof(LoadedSo::InitFn);
-        compatLogFmt("ELF: %zu constructors deferred (run after all SOs loaded)",
-                     so->init_arr_count);
+        compatLogFmt("ELF: %zu constructors deferred (arr=%p)",
+                     so->init_arr_count, (void*)so->init_arr);
     }
 
     free(file_data);
-    compatLogFmt("ELF: loaded OK exec_base=%p sym_count=%u unresolved=%d",
-                 (void*)exec_base, so->sym_count, g_unresolved_count);
+    compatLogFmt("ELF: loaded OK code_exec=%p data_exec=%p sym_count=%u unresolved=%d",
+                 (void*)code_exec, (void*)data_exec,
+                 so->sym_count, g_unresolved_count);
     return so;
 }
