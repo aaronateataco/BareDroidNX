@@ -191,6 +191,13 @@ static FILE* stub_fopen(const char* path, const char* mode) {
     if (!f) compatLogFmt("fopen FAIL: %s (mode=%s)", path ? path : "?", mode ? mode : "?");
     return f;
 }
+// open() wrapper — logs every call so we can trace early constructor I/O
+static int stub_open(const char* path, int flags, ...) {
+    int fd = open(path, flags);
+    if (fd < 0) compatLogFmt("open FAIL: %s flags=0x%x", path ? path : "?", flags);
+    else        compatLogFmt("open OK:   %s flags=0x%x fd=%d", path ? path : "?", flags, fd);
+    return fd;
+}
 
 // ─── __android_log_print (liblog) ────────────────────────────────────────────
 static int android_log_print(int, const char* tag, const char* fmt, ...) {
@@ -266,7 +273,12 @@ static int pt_setspecific(int k, const void* v) {
     return 0;
 }
 static int pt_once(int* ctrl, void (*fn)(void)) {
-    if (*ctrl == 0) { *ctrl = 1; fn(); }
+    if (*ctrl == 0) {
+        compatLogFmt("pthread_once: calling fn @%p", (void*)fn);
+        *ctrl = 1;
+        fn();
+        compatLog("pthread_once: fn returned");
+    }
     return 0;
 }
 static int pt_attr_init(void* a)    { memset(a, 0, 56); return 0; }
@@ -458,7 +470,9 @@ static long stub_sysconf(int n) {
     switch (n) {
         case 30: return 4096;  // _SC_PAGESIZE
         case 84: return 4;     // _SC_NPROCESSORS_ONLN — Tegra X1 has 4 ARM cores
-        default: return -1;
+        default:
+            compatLogFmt("sysconf(%d) -> -1 (unknown)", n);
+            return -1;
     }
 }
 static char* stub_getcwd(char* buf, size_t sz) {
@@ -754,7 +768,7 @@ static const ShimEntry g_shims[] = {
     {"getc",        (void*)getc},
     {"putc",        (void*)putc},
     {"ungetc",      (void*)ungetc},
-    {"open",        (void*)open},
+    {"open",        (void*)stub_open},
     {"close",       (void*)close},
     {"read",        (void*)read},
     {"write",       (void*)write},
